@@ -1,5 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import { Document, Packer, Paragraph, TextRun, SectionType, AlignmentType } from 'docx';
+import { Document, Packer, Paragraph, TextRun, SectionType, AlignmentType, HeadingLevel } from 'docx';
 import { saveFile } from './fileSaver';
 
 // Setup PDF.js worker
@@ -34,80 +34,115 @@ export const convertPdfToWord = async (file) => {
         return a.transform[4] - b.transform[4];
       });
 
-      let currentLineY = items[0].transform[5];
-      let lineItems = [];
-      
-      const processLine = (itemsInLine) => {
-        if (itemsInLine.length === 0) return;
+      let currentParagraphItems = [];
+      let lastY = items[0].transform[5];
+      let lastLineY = items[0].transform[5];
 
-        // Calculate alignment based on first item's X
-        const firstX = itemsInLine[0].transform[4];
+      const createParagraph = (itemsInPara) => {
+        if (itemsInPara.length === 0) return;
+
+        // Group into lines to detect alignment and structure
+        const lines = [];
+        let currentLine = [];
+        let lineY = itemsInPara[0].transform[5];
+        
+        itemsInPara.forEach(item => {
+          if (Math.abs(item.transform[5] - lineY) > 3) {
+            lines.push(currentLine);
+            currentLine = [item];
+            lineY = item.transform[5];
+          } else {
+            currentLine.push(item);
+          }
+        });
+        if (currentLine.length > 0) lines.push(currentLine);
+
+        // Detect Alignment from the first line
+        const firstLine = lines[0];
+        const firstX = firstLine[0].transform[4];
         const pageWidth = viewport.width;
         let alignment = AlignmentType.LEFT;
         
-        // Simple heuristic for centering
-        const lineContent = itemsInLine.map(i => i.str).join('');
-        if (firstX > pageWidth * 0.25 && lineContent.length < 50) {
-           // Might be centered or right-aligned
-           if (firstX > pageWidth * 0.5) alignment = AlignmentType.RIGHT;
-           else alignment = AlignmentType.CENTER;
+        // Better centering detection
+        if (firstX > pageWidth * 0.2) {
+           const lineText = firstLine.map(i => i.str).join('');
+           if (lineText.length < 60) {
+              if (firstX > pageWidth * 0.4) alignment = AlignmentType.CENTER;
+              if (firstX > pageWidth * 0.6) alignment = AlignmentType.RIGHT;
+           }
         }
 
-        const runs = itemsInLine.map(item => {
-          // Calculate font size: scale factor in transform
-          // scale factor is often transform[0] or transform[3]
-          const fontSizeInPoints = Math.abs(item.transform[0]);
-          
-          // Detect bold/italic from font name
+        // Detect Heading Level
+        const avgFontSize = itemsInPara.reduce((acc, i) => acc + Math.abs(i.transform[0]), 0) / itemsInPara.length;
+        let heading = undefined;
+        if (avgFontSize > 18) heading = HeadingLevel.HEADING_1;
+        else if (avgFontSize > 14) heading = HeadingLevel.HEADING_2;
+
+        const runs = [];
+        itemsInPara.forEach((item, idx) => {
+          const fontSize = Math.abs(item.transform[0]);
           const fontName = (item.fontName || "").toLowerCase();
-          const isBold = fontName.includes('bold') || fontName.includes('black') || fontName.includes('heavy');
+          const isBold = fontName.includes('bold') || fontName.includes('black') || avgFontSize > 14;
           const isItalic = fontName.includes('italic') || fontName.includes('oblique');
 
-          return new TextRun({
+          // Add space if there's a horizontal gap
+          if (idx > 0) {
+             const prevItem = itemsInPara[idx - 1];
+             const isSameLine = Math.abs(item.transform[5] - prevItem.transform[5]) < 3;
+             if (isSameLine) {
+                const gap = item.transform[4] - (prevItem.transform[4] + prevItem.width);
+                if (gap > 2 && !prevItem.str.endsWith(' ') && !item.str.startsWith(' ')) {
+                   runs.push(new TextRun(" "));
+                }
+             } else {
+                // Manual line break if they are in the same paragraph but different lines
+                runs.push(new TextRun({ text: "", break: 1 }));
+             }
+          }
+
+          runs.push(new TextRun({
             text: item.str,
-            size: fontSizeInPoints * 2, // docx expects half-points
+            size: fontSize * 2,
             bold: isBold,
             italics: isItalic,
-          });
+          }));
         });
 
         docChildren.push(new Paragraph({
           children: runs,
           alignment: alignment,
+          heading: heading,
           spacing: {
-            before: 120, // Add some default spacing
-            after: 120,
+            before: 200,
+            after: 200,
+            line: 360, // 1.5 line spacing
           }
         }));
       };
 
       items.forEach((item, index) => {
         const y = item.transform[5];
+        const yGap = Math.abs(y - lastLineY);
         
-        if (Math.abs(y - currentLineY) > 3) {
-          processLine(lineItems);
-          lineItems = [item];
-          currentLineY = y;
+        // If the vertical gap is small, keep it in the same paragraph
+        // Typical line height is ~12-15 points. Gap > 20 usually means new paragraph.
+        if (yGap > 25 && index > 0) {
+          createParagraph(currentParagraphItems);
+          currentParagraphItems = [item];
         } else {
-          // Check for horizontal spacing
-          if (lineItems.length > 0) {
-            const lastItem = lineItems[lineItems.length - 1];
-            const gap = item.transform[4] - (lastItem.transform[4] + lastItem.width);
-            if (gap > 5) {
-               lineItems.push({ str: ' ', transform: item.transform, fontName: item.fontName });
-            }
-          }
-          lineItems.push(item);
+          currentParagraphItems.push(item);
         }
-
+        
+        if (Math.abs(y - lastLineY) > 3) {
+           lastLineY = y;
+        }
+        
         if (index === items.length - 1) {
-          processLine(lineItems);
+          createParagraph(currentParagraphItems);
         }
       });
 
       if (pageNum < numPages) {
-        // We use a manual break or just start a new page
-        // docx Section handles pages, but we can add page break runs
         docChildren.push(new Paragraph({
           children: [new TextRun({ text: "", break: 1 })]
         }));
@@ -119,10 +154,10 @@ export const convertPdfToWord = async (file) => {
         properties: {
           page: {
             margin: {
-              top: 720, // 0.5 inch
-              right: 720,
-              bottom: 720,
-              left: 720,
+              top: 1440, // 1 inch
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
             },
           },
           type: SectionType.CONTINUOUS,
