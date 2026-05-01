@@ -1,10 +1,9 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import { Document, Packer, Paragraph, ImageRun, SectionType } from 'docx';
+import { Document, Packer, Paragraph, TextRun, SectionType } from 'docx';
 import { saveFile } from './fileSaver';
 
-// Setup PDF.js worker for version 3.x
-// Using a CDN to ensure version match and avoid Vite bundling issues with workers
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js`;
+// Setup PDF.js worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 export const convertPdfToWord = async (file) => {
   try {
@@ -13,70 +12,76 @@ export const convertPdfToWord = async (file) => {
     const pdf = await loadingTask.promise;
     const numPages = pdf.numPages;
 
-    const sections = [];
+    const docChildren = [];
 
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
-      // Using scale 2 for better resolution
-      const viewport = page.getViewport({ scale: 2 });
+      const textContent = await page.getTextContent();
+      const items = textContent.items;
+
+      if (items.length === 0) {
+        // Fallback for scanned pages: inform the user or use OCR (which we don't have client-side easily)
+        docChildren.push(new Paragraph({
+          children: [new TextRun({ text: `[Page ${pageNum} contains no extractable text. It might be a scanned image.]`, italic: true, color: "888888" })]
+        }));
+        continue;
+      }
+
+      // Sort items: Y coordinate descending (top to bottom), then X coordinate ascending (left to right)
+      // item.transform: [scaleX, skewY, skewX, scaleY, transformX, transformY]
+      items.sort((a, b) => {
+        const yDiff = b.transform[5] - a.transform[5];
+        if (Math.abs(yDiff) > 5) { // Threshold for being on the same line
+          return yDiff;
+        }
+        return a.transform[4] - b.transform[4];
+      });
+
+      let currentLineY = items[0].transform[5];
+      let currentLineText = "";
       
-      const canvas = document.createElement('canvas');
-      const context = canvas.getContext('2d');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
+      items.forEach((item, index) => {
+        const y = item.transform[5];
+        
+        if (Math.abs(y - currentLineY) > 5) {
+          // New line detected
+          docChildren.push(new Paragraph({
+            children: [new TextRun(currentLineText.trim())]
+          }));
+          currentLineText = item.str;
+          currentLineY = y;
+        } else {
+          // Same line
+          // Add space if there's a gap between items
+          if (currentLineText && !currentLineText.endsWith(' ') && !item.str.startsWith(' ')) {
+             currentLineText += " ";
+          }
+          currentLineText += item.str;
+        }
 
-      await page.render({ canvasContext: context, viewport }).promise;
-      
-      // Convert canvas to blob
-      const blob = await new Promise((resolve, reject) => {
-        canvas.toBlob((b) => {
-          if (b) resolve(b);
-          else reject(new Error('Canvas to Blob conversion failed'));
-        }, 'image/png');
-      });
-      const imageArrayBuffer = await blob.arrayBuffer();
-
-      // In docx, dimensions are in pixels? Actually it depends on the version.
-      // For ImageRun in recent versions, it's usually EMU or abstracted.
-      // Transformation width/height in docx 8/9 are points.
-      // viewport.width is pixels at scale 2. Original points = pixels / 2.
-      const widthInPoints = viewport.width / 2;
-      const heightInPoints = viewport.height / 2;
-
-      const imgRun = new ImageRun({
-        data: imageArrayBuffer,
-        transformation: {
-          width: widthInPoints,
-          height: heightInPoints,
-        },
+        // Add the last line of the page
+        if (index === items.length - 1) {
+          docChildren.push(new Paragraph({
+            children: [new TextRun(currentLineText.trim())]
+          }));
+        }
       });
 
-      sections.push({
-        properties: {
-          page: {
-            size: {
-              width: widthInPoints * 20, // points to twips
-              height: heightInPoints * 20,
-            },
-            margin: {
-              top: 0,
-              right: 0,
-              bottom: 0,
-              left: 0,
-            },
-          },
-          type: pageNum === 1 ? SectionType.CONTINUOUS : SectionType.NEXT_PAGE,
-        },
-        children: [
-          new Paragraph({
-            children: [imgRun],
-          }),
-        ],
-      });
+      // Add a page break if not the last page
+      if (pageNum < numPages) {
+        docChildren.push(new Paragraph({
+          children: [new TextRun({ text: "", break: 1 })]
+        }));
+      }
     }
 
     const doc = new Document({
-      sections: sections,
+      sections: [{
+        properties: {
+          type: SectionType.CONTINUOUS,
+        },
+        children: docChildren,
+      }],
     });
 
     const docxBlob = await Packer.toBlob(doc);
